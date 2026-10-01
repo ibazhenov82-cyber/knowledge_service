@@ -1,0 +1,16 @@
+# Сервис баз знаний (knowledge_service).
+fastapi>=0.110          # REST API /api/v1
+uvicorn>=0.29           # ASGI-сервер
+python-multipart>=0.0.9 # загрузка файлов (multipart/form-data)
+pydantic>=2.0
+httpx>=0.27             # Ollama / OpenAI-совместимые эмбеддинги, загрузка по ссылкам
+numpy>=1.26             # векторный поиск (косинусное сходство)
+
+# Форматы документов
+pypdf>=4.0              # .pdf
+python-docx>=1.1        # .docx
+python-pptx>=0.6.23     # .pptx
+openpyxl>=3.1           # .xlsx
+
+# Тесты (необязательно): reportlab — генерация PDF в test_formats
+# reportlab>=4.0

@@ -1,0 +1,13 @@
+{
+  "openai": {
+    "title": "OpenAI",
+    "base_url": "https://api.openai.com/v1",
+    "api_key": "${OPENAI_API_KEY}",
+    "models": ["text-embedding-3-small", "text-embedding-3-large"]
+  },
+  "lmstudio": {
+    "title": "LM Studio",
+    "base_url": "http://localhost:1234/v1",
+    "models": ["text-embedding-nomic-embed-text-v1.5"]
+  }
+}
