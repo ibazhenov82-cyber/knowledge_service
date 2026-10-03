@@ -47,6 +47,9 @@ def main() -> None:
             line += f" — недоступен ({exc})"
         print(line)
     rerank_models = [m["id"] + (" (по умолчанию)" if m["default"] else "") for m in reranker.models()]
+    for model_id, seconds, error in reranker.probe():
+        state = f"отвечает за {seconds:.1f} с на 2 коротких фрагмента" if error is None else f"НЕ отвечает: {error}"
+        print(f"[knowledge] Реранкер {model_id}: {state}")
     print("[knowledge] Реранкинг: эвристика (без LLM)"
           + (f"; модели-реранкеры: {', '.join(rerank_models)}" if rerank_models else "; моделей-реранкеров нет"))
     roots = ", ".join(os.path.abspath(r) for r in settings.roots) if settings.roots else "не заданы (источники «путь» выключены)"

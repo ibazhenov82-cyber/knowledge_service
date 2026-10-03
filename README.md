@@ -147,7 +147,15 @@ Notion формирует страницы через JavaScript, поэтому
 - `jina` — `POST {base_url}/rerank` `{model, query, documents, top_n}` → `{results: [{index, relevance_score}]}`: llama.cpp server с `--reranking`, Infinity, Jina, Cohere;
 - `tei` — `POST {base_url}/rerank` `{query, texts}` → `[{index, score}]`: Hugging Face Text Embeddings Inference.
 
-Модель по умолчанию — `KB_DEFAULT_RERANK_MODEL`, иначе первая модель файла; таймаут — `KB_RERANK_TIMEOUT`. У Ollama официального API реранкинга нет, поэтому локально удобнее всего llama.cpp:
+Модель по умолчанию — `KB_DEFAULT_RERANK_MODEL`, иначе первая модель файла.
+
+**Время.** Cross-encoder на CPU обрабатывает каждый фрагмент целиком, поэтому время растёт с числом кандидатов и длиной фрагментов (десятки секунд на 30 фрагментов по 400 токенов — обычное дело). Ограничения:
+
+- `KB_RERANK_TIMEOUT` (20 с) — сколько ждать модель; не дождались — эвристика, в ответе `rerank.fallback=true` и причина;
+- `KB_RERANK_MAX_CHARS` (1500) — сколько символов фрагмента (начало с заголовком) уходит модели, `0` — весь фрагмент;
+- `rerank.elapsed_ms` в ответе — сколько занял второй этап.
+
+`KB_RERANK_TIMEOUT` держите заметно меньше тайм-аута поиска у клиента (`KNOWLEDGE_SERVICE_TIMEOUT` в AgentsCore, 60 с): иначе клиент оборвёт запрос раньше, чем сработает откат на эвристику. Чтобы ускорить реранкинг, уменьшите «Кандидатов до фильтрации» (10–15), размер фрагментов или возьмите более лёгкую квантизацию модели. У Ollama официального API реранкинга нет, поэтому локально удобнее всего llama.cpp:
 
 ```bash
 llama-server -m bge-reranker-v2-m3-Q8_0.gguf --reranking --port 8081
@@ -157,7 +165,7 @@ llama-server -m bge-reranker-v2-m3-Q8_0.gguf --reranking --port 8081
 
 ```json
 "stages": {"candidates": 20, "after_threshold": 12, "after_dedup": 11, "after_rerank": 4, "returned": 4},
-"rerank": {"method": "heuristic", "model": null, "fallback": false, "error": null}
+"rerank": {"method": "heuristic", "model": null, "fallback": false, "error": null, "elapsed_ms": 3}
 ```
 
 ## REST API `/api/v1`

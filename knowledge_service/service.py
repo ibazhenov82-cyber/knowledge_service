@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -131,6 +132,8 @@ class KnowledgeService:
         self.settings = settings
         #: Модели-реранкеры (второй этап поиска); пусто — доступна только эвристика.
         self.reranker = reranker or RerankRegistry()
+        #: Сколько символов фрагмента уходит модели-реранкеру (0 — без ограничения).
+        self.rerank_max_chars = settings.rerank_max_chars
         os.makedirs(settings.data_dir, exist_ok=True)
         self.files_dir = os.path.join(settings.data_dir, "files")
         os.makedirs(self.files_dir, exist_ok=True)
@@ -1275,18 +1278,23 @@ class KnowledgeService:
         stages["after_dedup"] = len(items)
 
         # ---- Этап 2: реранкинг ----
-        rerank_info: Dict[str, Any] = {"method": method, "model": None, "fallback": False, "error": None}
+        rerank_info: Dict[str, Any] = {"method": method, "model": None, "fallback": False, "error": None,
+                                       "elapsed_ms": None}
         if method != "none" and items:
             texts = [self._rerank_text(it["row"], it["doc"]) for it in items]
             scores_2: Optional[List[float]] = None
+            started = time.monotonic()
             if method == "model":
+                limit = self.rerank_max_chars
+                model_texts = [t if len(t) <= limit else t[:limit] for t in texts] if limit > 0 else texts
                 try:
-                    rerank_info["model"], scores_2 = self.reranker.rerank(rerank_model, query, texts)
+                    rerank_info["model"], scores_2 = self.reranker.rerank(rerank_model, query, model_texts)
                 except RerankError as exc:
                     log.warning("реранкинг моделью не удался, применена эвристика: %s", exc)
                     rerank_info.update(fallback=True, error=str(exc))
             if scores_2 is None:
                 scores_2 = heuristic_scores(query, texts, [it["vector_score"] for it in items])
+            rerank_info["elapsed_ms"] = int((time.monotonic() - started) * 1000)
             for it, value in zip(items, scores_2):
                 it["rerank_score"] = value
             items.sort(key=lambda it: -it["rerank_score"])

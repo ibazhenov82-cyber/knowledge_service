@@ -110,7 +110,14 @@ class KnowledgeConfig:
     RERANK_PROVIDERS_FILE: str = os.environ.get("RERANK_PROVIDERS_FILE", "").strip()
     #: Реранкер по умолчанию («провайдер/модель»); пусто — первый из файла.
     DEFAULT_RERANK_MODEL: str = os.environ.get("KB_DEFAULT_RERANK_MODEL", "").strip()
-    RERANK_TIMEOUT: float = _float_env("KB_RERANK_TIMEOUT", 60.0)
+    #: Сколько ждать модель-реранкер; не дождались — эвристика (`rerank.fallback`).
+    #: Должно быть заметно меньше тайм-аута поиска у клиента (KNOWLEDGE_SERVICE_TIMEOUT
+    #: в AgentsCore), иначе клиент оборвёт запрос раньше, чем сработает откат.
+    RERANK_TIMEOUT: float = _float_env("KB_RERANK_TIMEOUT", 20.0)
+    #: Сколько символов фрагмента передавать модели-реранкеру (начало фрагмента
+    #: с заголовком): cross-encoder на CPU работает со скоростью, пропорциональной
+    #: длине текста, а для оценки релевантности начала обычно достаточно.
+    RERANK_MAX_CHARS: int = _int_env("KB_RERANK_MAX_CHARS", 1500)
     EMBED_TIMEOUT: float = _float_env("KB_EMBED_TIMEOUT", 120.0)
 
     # --- Выполнение ------------------------------------------------------------------
@@ -140,6 +147,7 @@ class Settings:
     default_embedding_model: str = "ollama/qwen3-embedding:0.6b"
     embed_batch: int = 32
     workers: int = 1
+    rerank_max_chars: int = 1500
 
     @classmethod
     def from_config(cls) -> "Settings":
@@ -150,4 +158,5 @@ class Settings:
             max_source_documents=c.MAX_SOURCE_DOCUMENTS, crawl_max_pages=c.CRAWL_MAX_PAGES,
             crawl_max_depth=c.CRAWL_MAX_DEPTH, http_timeout=c.HTTP_TIMEOUT,
             default_embedding_model=c.DEFAULT_EMBEDDING_MODEL, embed_batch=c.EMBED_BATCH, workers=c.WORKERS,
+            rerank_max_chars=c.RERANK_MAX_CHARS,
         )
