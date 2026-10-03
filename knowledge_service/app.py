@@ -19,6 +19,7 @@ from .api import router
 from .config import KnowledgeConfig, Settings
 from .embeddings import EmbeddingError, EmbeddingRegistry, OllamaProvider, load_providers_file
 from .fetch import UrlFetcher
+from .rerank import RerankRegistry, load_rerank_providers
 from .service import KnowledgeService, NotFoundError, ValidationError
 
 DESCRIPTION = """
@@ -40,13 +41,22 @@ def build_registry(settings: Settings) -> EmbeddingRegistry:
     return registry
 
 
+def build_reranker() -> RerankRegistry:
+    registry = RerankRegistry(default_model=KnowledgeConfig.DEFAULT_RERANK_MODEL)
+    if KnowledgeConfig.RERANK_PROVIDERS_FILE:
+        for provider in load_rerank_providers(KnowledgeConfig.RERANK_PROVIDERS_FILE, KnowledgeConfig.RERANK_TIMEOUT):
+            registry.add(provider)
+    return registry
+
+
 def create_app(service: Optional[KnowledgeService] = None, *, start_workers: bool = True,
                api_key: Optional[str] = None) -> FastAPI:
     if service is None:
         settings = Settings.from_config()
         service = KnowledgeService(settings, build_registry(settings),
                                    UrlFetcher(settings.allowed_hosts, settings.secrets, settings.http_timeout,
-                                              settings.max_file_bytes))
+                                              settings.max_file_bytes),
+                                   reranker=build_reranker())
     api_key = KnowledgeConfig.API_KEY if api_key is None else api_key
 
     @asynccontextmanager

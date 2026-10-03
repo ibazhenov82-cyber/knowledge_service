@@ -29,6 +29,8 @@ from .embeddings import EmbeddingError, EmbeddingRegistry
 from .fetch import FetchError, UrlFetcher
 from .formats import ExtractError, FileTypes, extension_of, parse_document, resolve_kind, supported_formats
 from .jobs import TERMINAL, JobRunner
+from .rerank import METHODS as RERANK_METHODS
+from .rerank import RerankError, RerankRegistry, heuristic_scores
 from .sources import (
     PLANNED_SOURCE_TYPES, SOURCE_TYPES, Loaded, SourceError, SourceItem, check_in_roots, enumerate_path,
     enumerate_url, read_path, text_item, validate_source,
@@ -125,8 +127,10 @@ class _JobCtx:
 
 class KnowledgeService:
     def __init__(self, settings: Settings, registry: EmbeddingRegistry, fetcher: Optional[UrlFetcher] = None,
-                 db: Optional[Database] = None):
+                 db: Optional[Database] = None, reranker: Optional[RerankRegistry] = None):
         self.settings = settings
+        #: Модели-реранкеры (второй этап поиска); пусто — доступна только эвристика.
+        self.reranker = reranker or RerankRegistry()
         os.makedirs(settings.data_dir, exist_ok=True)
         self.files_dir = os.path.join(settings.data_dir, "files")
         os.makedirs(self.files_dir, exist_ok=True)
@@ -1176,6 +1180,13 @@ class KnowledgeService:
         return {r["id"] for r in rows}
 
     def retrieve(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        """Двухэтапный поиск.
+
+        Этап 1: векторный поиск → `candidate_k` лучших кандидатов → порог
+        сходства `score_threshold` → схлопывание почти одинаковых фрагментов.
+        Этап 2: реранкинг (`rerank`: none | heuristic | model) → порог
+        `rerank_threshold` → `top_k`. В ответе — счётчики этапов (`stages`)
+        и оба балла у каждого фрагмента."""
         query = str(body.get("query") or "").strip()
         if not query:
             raise ValidationError("query: пустой запрос")
@@ -1185,14 +1196,40 @@ class KnowledgeService:
         top_k = int(body.get("top_k") or 5)
         if not 1 <= top_k <= 50:
             raise ValidationError("top_k: от 1 до 50")
+        candidate_k = int(body.get("candidate_k") or max(20, top_k))
+        if not 1 <= candidate_k <= 200:
+            raise ValidationError("candidate_k: от 1 до 200")
+        if candidate_k < top_k:
+            raise ValidationError("candidate_k (кандидатов до фильтрации) должно быть не меньше top_k")
         threshold = body.get("score_threshold")
         threshold = float(threshold) if threshold is not None else None
-        collections = {cid: self._collection_row(cid) for cid in dict.fromkeys(collection_ids)}
+        method = body.get("rerank") or "none"
+        if method not in RERANK_METHODS:
+            raise ValidationError(f"rerank: ожидается одно из {sorted(RERANK_METHODS)}")
+        rerank_threshold = body.get("rerank_threshold")
+        rerank_threshold = float(rerank_threshold) if rerank_threshold is not None else None
+        rerank_model = body.get("rerank_model") or None
+        # Удалённые (или пересозданные) коллекции не роняют весь поиск: ищем по
+        # оставшимся и сообщаем, каких нет; 404 — только если не нашлось ни одной.
+        collections: Dict[str, Dict[str, Any]] = {}
+        missing: List[str] = []
+        for cid in dict.fromkeys(collection_ids):
+            row = self.db.one("SELECT * FROM collections WHERE id = ?", (cid,))
+            if row:
+                collections[cid] = row
+            else:
+                missing.append(cid)
+        if not collections:
+            raise NotFoundError(
+                f"базы знаний не найдены: {', '.join(missing)} — возможно, они удалены или сервис пересоздал "
+                "базу; выберите базы знаний в настройках заново"
+            )
         allowed = self._filter_ids(list(collections), body.get("filters") or {})
 
+        # ---- Этап 1: векторный поиск ----
         query_vectors: Dict[str, np.ndarray] = {}
-        candidates: List[Tuple[float, str, np.ndarray]] = []
-        for cid, collection in collections.items():
+        found: List[Tuple[float, str, np.ndarray]] = []
+        for collection in collections.values():
             index = self._get_index(collection)
             if not index.ids:
                 continue
@@ -1206,25 +1243,25 @@ class KnowledgeService:
             if index.matrix.shape[1] != q.shape[0]:
                 continue
             scores = index.matrix @ q
-            order = np.argsort(-scores)
-            for i in order[: max(top_k * 10, 50)] if allowed is None else order:
-                score = float(scores[i])
-                if threshold is not None and score < threshold:
-                    break
-                if allowed is not None and index.ids[i] not in allowed:
-                    continue
-                candidates.append((score, index.ids[i], index.matrix[i]))
-                if allowed is not None and len(candidates) >= top_k * 10 * len(collections):
-                    break
-        candidates.sort(key=lambda c: -c[0])
+            if allowed is not None:
+                mask = np.array([cid in allowed for cid in index.ids], dtype=bool)
+                scores = np.where(mask, scores, -np.inf)
+            order = np.argsort(-scores)[:candidate_k]
+            for i in order:
+                if np.isfinite(scores[i]):
+                    found.append((float(scores[i]), index.ids[i], index.matrix[i]))
+        found.sort(key=lambda c: -c[0])
+        candidates = found[:candidate_k]
+        stages: Dict[str, Any] = {"candidates": len(candidates)}
+        if threshold is not None:
+            candidates = [c for c in candidates if c[0] >= threshold]
+        stages["after_threshold"] = len(candidates)
 
-        results: List[Dict[str, Any]] = []
+        items: List[Dict[str, Any]] = []
         picked_vectors: List[np.ndarray] = []
         picked_hashes = set()
         duplicates = 0
         for score, chunk_id, vector in candidates:
-            if len(results) >= top_k:
-                break
             row = self.db.one("SELECT * FROM chunks WHERE id = ?", (chunk_id,))
             if not row:
                 continue
@@ -1234,22 +1271,62 @@ class KnowledgeService:
             picked_hashes.add(row["text_hash"])
             picked_vectors.append(vector)
             doc = self.db.one("SELECT * FROM documents WHERE id = ?", (row["document_id"],))
+            items.append({"row": row, "doc": doc, "vector_score": round(score, 4), "rerank_score": None})
+        stages["after_dedup"] = len(items)
+
+        # ---- Этап 2: реранкинг ----
+        rerank_info: Dict[str, Any] = {"method": method, "model": None, "fallback": False, "error": None}
+        if method != "none" and items:
+            texts = [self._rerank_text(it["row"], it["doc"]) for it in items]
+            scores_2: Optional[List[float]] = None
+            if method == "model":
+                try:
+                    rerank_info["model"], scores_2 = self.reranker.rerank(rerank_model, query, texts)
+                except RerankError as exc:
+                    log.warning("реранкинг моделью не удался, применена эвристика: %s", exc)
+                    rerank_info.update(fallback=True, error=str(exc))
+            if scores_2 is None:
+                scores_2 = heuristic_scores(query, texts, [it["vector_score"] for it in items])
+            for it, value in zip(items, scores_2):
+                it["rerank_score"] = value
+            items.sort(key=lambda it: -it["rerank_score"])
+            if rerank_threshold is not None:
+                items = [it for it in items if it["rerank_score"] >= rerank_threshold]
+        stages["after_rerank"] = len(items)
+        items = items[:top_k]
+        stages["returned"] = len(items)
+
+        results: List[Dict[str, Any]] = []
+        for it in items:
+            row, doc = it["row"], it["doc"]
             collection = collections[row["collection_id"]]
-            meta = self._doc_metadata(doc)
+            final = it["rerank_score"] if it["rerank_score"] is not None else it["vector_score"]
             results.append({
-                "chunk_id": row["id"], "score": round(score, 4), "text": row["text"], "section": row["section"],
+                "chunk_id": row["id"], "score": final, "vector_score": it["vector_score"],
+                "rerank_score": it["rerank_score"], "text": row["text"], "section": row["section"],
                 "page": row["page"], "seq": row["seq"], "tokens": row["tokens"],
                 "metadata": self._chunk_metadata(row, doc),
                 "document": {
                     "id": doc["id"], "title": doc["title"] or doc["filename"], "source": doc["uri"],
                     "source_type": doc["source_type"], "source_id": doc["source_id"], "filename": doc["filename"],
                     "doc_type": doc["doc_type"], "doc_date": doc["doc_date"], "doc_version": doc["doc_version"],
-                    "metadata": meta,
+                    "metadata": self._doc_metadata(doc),
                 },
                 "collection": {"id": collection["id"], "name": collection["name"]},
             })
-        return {"query": query, "results": results, "duplicates_skipped": duplicates,
-                "searched_collections": len(collections)}
+        return {"query": query, "results": results, "stages": stages, "rerank": rerank_info,
+                "duplicates_skipped": duplicates, "searched_collections": len(collections),
+                "missing_collections": missing}
+
+    @staticmethod
+    def _rerank_text(row: Dict[str, Any], doc: Dict[str, Any]) -> str:
+        """Текст фрагмента для реранкинга: название документа и раздел дают
+        контекст коротким фрагментам."""
+        head = " › ".join(p for p in (doc["title"] or doc["filename"], row["section"]) if p)
+        return f"{head}\n{row['text']}" if head else row["text"]
+
+    def rerank_models(self) -> Dict[str, Any]:
+        return {"items": self.reranker.models(), "default": self.reranker.default_id()}
 
     # ------------------------------------------------------------------
     # Служебное
@@ -1265,6 +1342,11 @@ class KnowledgeService:
             ] + [{"type": t, "title": title, "enabled": False} for t, title in PLANNED_SOURCE_TYPES.items()],
             "formats": supported_formats(),
             "chunking_methods": [{"id": k, "title": v} for k, v in METHODS.items()],
+            "rerank_methods": [
+                {"id": k, "title": v, "enabled": k != "model" or self.reranker.available}
+                for k, v in RERANK_METHODS.items()
+            ],
+            "rerank_models": self.reranker.models(),
             "default_chunking": ChunkingConfig().to_dict(),
             "default_file_types": FileTypes().to_dict(),
             "default_embedding_model": self.settings.default_embedding_model,
@@ -1274,7 +1356,7 @@ class KnowledgeService:
                 "max_file_mb": self.settings.max_file_bytes // (1024 * 1024),
                 "max_source_documents": self.settings.max_source_documents,
                 "crawl_max_pages": self.settings.crawl_max_pages, "crawl_max_depth": self.settings.crawl_max_depth,
-                "top_k_max": 50,
+                "top_k_max": 50, "candidate_k_max": 200,
             },
         }
 

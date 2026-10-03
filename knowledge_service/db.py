@@ -147,12 +147,49 @@ def row_to_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
     return result
 
 
+class SchemaMismatchError(RuntimeError):
+    """Файл базы создан прежней версией сервиса: миграций нет, базу нужно пересоздать."""
+
+
+def _columns(conn: sqlite3.Connection) -> Dict[str, List[str]]:
+    tables = [r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")]
+    return {t: [r[1] for r in conn.execute(f"PRAGMA table_info({t})")] for t in tables}
+
+
+def schema_differences(conn: sqlite3.Connection) -> List[str]:
+    """Расхождения схемы файла с текущей [SCHEMA]: «таблица: нет колонок …»."""
+    reference = sqlite3.connect(":memory:")
+    try:
+        reference.executescript(SCHEMA)
+        expected = _columns(reference)
+    finally:
+        reference.close()
+    actual = _columns(conn)
+    problems = []
+    for table, columns in expected.items():
+        if table not in actual:
+            continue  # новая таблица создаётся сама (CREATE TABLE IF NOT EXISTS)
+        missing = [c for c in columns if c not in actual[table]]
+        if missing:
+            problems.append(f"{table}: нет колонок {', '.join(missing)}")
+    return problems
+
+
 class Database:
     def __init__(self, path: str):
         self.path = path
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(SCHEMA)
+            problems = schema_differences(conn)
+        if problems:
+            # Без проверки сервис стартует, а падает на первой загрузке с
+            # «no such column» — лучше сразу и с понятной подсказкой.
+            raise SchemaMismatchError(
+                f"база {path} создана прежней версией сервиса ({'; '.join(problems)}). "
+                "Миграций нет: остановите сервис, удалите файл базы (и knowledge.sqlite-wal, "
+                "knowledge.sqlite-shm рядом) и запустите сервис заново — базы знаний нужно будет загрузить повторно."
+            )
 
     @contextlib.contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:

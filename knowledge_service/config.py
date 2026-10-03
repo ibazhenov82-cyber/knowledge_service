@@ -103,6 +103,14 @@ class KnowledgeConfig:
     #: embedding_providers.example.json). Пусто — только Ollama.
     EMBEDDING_PROVIDERS_FILE: str = os.environ.get("EMBEDDING_PROVIDERS_FILE", "").strip()
     EMBED_BATCH: int = _int_env("KB_EMBED_BATCH", 32)
+
+    # --- Реранкинг ----------------------------------------------------------------------
+    #: JSON-файл моделей-реранкеров (см. rerank_providers.example.json). Пусто —
+    #: доступна только «Эвристика (без LLM)».
+    RERANK_PROVIDERS_FILE: str = os.environ.get("RERANK_PROVIDERS_FILE", "").strip()
+    #: Реранкер по умолчанию («провайдер/модель»); пусто — первый из файла.
+    DEFAULT_RERANK_MODEL: str = os.environ.get("KB_DEFAULT_RERANK_MODEL", "").strip()
+    RERANK_TIMEOUT: float = _float_env("KB_RERANK_TIMEOUT", 60.0)
     EMBED_TIMEOUT: float = _float_env("KB_EMBED_TIMEOUT", 120.0)
 
     # --- Выполнение ------------------------------------------------------------------

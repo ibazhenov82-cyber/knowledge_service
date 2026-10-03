@@ -24,9 +24,12 @@ python -m knowledge_service
 - каталог данных;
 - модель эмбеддингов по умолчанию;
 - доступность провайдеров эмбеддингов;
+- модели-реранкеры из `RERANK_PROVIDERS_FILE`;
 - разрешённые каталоги `KB_ROOTS`;
 - внутренние хосты и секреты (только имена);
 - поддерживаемые форматы.
+
+Миграций базы нет. Если после обновления сервиса схема изменилась, сервис не стартует и пишет, каких колонок не хватает: остановите его, удалите `knowledge.sqlite` (и `-wal`, `-shm` рядом) и запустите заново — базы знаний нужно загрузить повторно.
 
 AgentsCore указывает на сервис переменной `KNOWLEDGE_SERVICE_URL=http://<host>:8003`, AgentsApp — адресом «Адрес сервиса баз знаний» в «Настройках».
 
@@ -125,12 +128,37 @@ Notion формирует страницы через JavaScript, поэтому
 
 Смена модели через `PATCH` запускает переиндексацию коллекции. Векторы нормируются по длине (L2) и кэшируются по хешу текста. Для Qwen3-Embedding, nomic-embed-text и E5 автоматически добавляются нужные префиксы запроса и документа.
 
-Как устроен поиск:
+Фильтры поиска: `document_ids`, `source_ids`, `doc_types`, `source_types`, `languages`, `doc_date: {gte, lte}`, `metadata: {ключ: значение | [значения]}`.
 
-- косинусное сходство — скалярное произведение нормированных векторов (numpy по индексу в памяти, индекс перестраивается при изменениях);
-- порог `score_threshold`;
-- почти одинаковые фрагменты схлопываются;
-- фильтры: `document_ids`, `source_ids`, `doc_types`, `source_types`, `languages`, `doc_date: {gte, lte}`, `metadata: {ключ: значение | [значения]}`.
+### Реранкинг и фильтрация
+
+Поиск идёт в два этапа:
+
+1. **Векторный поиск.** Косинусное сходство (скалярное произведение нормированных векторов, numpy по индексу в памяти) → топ `candidate_k` кандидатов (по умолчанию max(20, `top_k`), до 200) → порог `score_threshold` → схлопывание почти одинаковых фрагментов (одинаковый хеш текста или сходство векторов > 0,97).
+2. **Реранкинг** (`rerank`) → порог `rerank_threshold` → топ `top_k`:
+   - `none` — «Нет»: итоговый балл — векторное сходство, `rerank_threshold` не применяется;
+   - `heuristic` — «Эвристика (без LLM)»: 0,6 × векторное сходство + 0,4 × BM25 по словам вопроса среди кандидатов (основа слова — первые 6 символов, без стоп-слов), нормированный к лучшему кандидату;
+   - `model` — «Модель-реранкер»: cross-encoder оценивает пары «вопрос — фрагмент» (фрагмент передаётся с префиксом «документ › раздел»). Модель — `rerank_model` («провайдер/модель») или модель по умолчанию.
+
+Баллы обоих способов лежат в 0..1: сырые логиты cross-encoder переводятся сигмоидой. Если модель-реранкер не настроена или недоступна, применяется эвристика, а в ответе будет `rerank.fallback=true` и причина.
+
+Модели-реранкеры (одна или несколько) описываются в файле `RERANK_PROVIDERS_FILE` (см. `rerank_providers.example.json`). Для каждого провайдера указываются `base_url`, `models`, `title`, `api_key` (ссылкой `${ПЕРЕМЕННАЯ}`) и `api`:
+
+- `jina` — `POST {base_url}/rerank` `{model, query, documents, top_n}` → `{results: [{index, relevance_score}]}`: llama.cpp server с `--reranking`, Infinity, Jina, Cohere;
+- `tei` — `POST {base_url}/rerank` `{query, texts}` → `[{index, score}]`: Hugging Face Text Embeddings Inference.
+
+Модель по умолчанию — `KB_DEFAULT_RERANK_MODEL`, иначе первая модель файла; таймаут — `KB_RERANK_TIMEOUT`. У Ollama официального API реранкинга нет, поэтому локально удобнее всего llama.cpp:
+
+```bash
+llama-server -m bge-reranker-v2-m3-Q8_0.gguf --reranking --port 8081
+```
+
+Ответ поиска, кроме фрагментов (`score` — итоговый балл, `vector_score`, `rerank_score`), содержит трассировку этапов:
+
+```json
+"stages": {"candidates": 20, "after_threshold": 12, "after_dedup": 11, "after_rerank": 4, "returned": 4},
+"rerank": {"method": "heuristic", "model": null, "fallback": false, "error": null}
+```
 
 ## REST API `/api/v1`
 
@@ -156,8 +184,9 @@ Notion формирует страницы через JavaScript, поэтому
 | `GET /collections/{id}/jobs`, `POST /jobs/{id}/cancel` | задачи коллекции; отмена |
 | `GET /documents/{id}/chunks`, `POST /documents/{id}/chunks` | фрагменты; добавить фрагмент вручную (сохраняется при переиндексации) |
 | `GET/PATCH/DELETE /chunks/{id}` | фрагмент; правка текста пересчитывает эмбеддинг |
-| `POST /retrieval` | поиск: `query`, `collection_ids`, `top_k` (≤ 50), `score_threshold`, `filters` |
-| `GET /health`, `/info`, `/embedding-models`, `/fs?path=` | состояние и доступность провайдеров; форматы, типы источников и лимиты; модели эмбеддингов; просмотр каталогов внутри `KB_ROOTS` |
+| `POST /retrieval` | поиск: `query`, `collection_ids`, `top_k` (≤ 50), `candidate_k` (≥ `top_k`, ≤ 200), `score_threshold`, `rerank` (`none` / `heuristic` / `model`), `rerank_model`, `rerank_threshold`, `filters` → `results`, `stages`, `rerank` |
+| `GET /rerank-models` | модели-реранкеры `{items: [{id, provider, model, provider_title, default}], default}` |
+| `GET /health`, `/info`, `/embedding-models`, `/fs?path=` | состояние и доступность провайдеров; форматы, типы источников, способы реранкинга (`rerank_methods` с признаком `enabled`) и лимиты; модели эмбеддингов; просмотр каталогов внутри `KB_ROOTS` |
 
 Если задан `KNOWLEDGE_API_KEY`, запросы (кроме `/health`) должны нести заголовок `Authorization: Bearer <ключ>`. В AgentsCore этот же ключ задаётся в `KNOWLEDGE_SERVICE_API_KEY`.
 
@@ -168,6 +197,7 @@ Notion формирует страницы через JavaScript, поэтому
 - `formats.py`, `code_structure.py` — извлечение текста и структуры.
 - `chunking.py` — оба способа разбиения.
 - `embeddings.py` — провайдеры (Ollama, OpenAI-совместимые) и кэш.
+- `rerank.py` — второй этап поиска: эвристика (BM25 + вектор) и модели-реранкеры.
 - `fetch.py` — загрузка по ссылкам с защитой от внутренних адресов.
 - `sources.py` — проверка и перечисление источников.
 - `jobs.py` — рабочие потоки.

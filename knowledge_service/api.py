@@ -112,8 +112,12 @@ class ChunkPatch(_Model):
 class RetrievalRequest(_Model):
     query: str
     collection_ids: List[str]
-    top_k: int = 5
-    score_threshold: Optional[float] = Field(None, description="Минимальное косинусное сходство")
+    top_k: int = Field(5, description="Фрагментов после фильтрации (1–50)")
+    candidate_k: Optional[int] = Field(None, description="Кандидатов до фильтрации (по умолчанию max(20, top_k), до 200)")
+    score_threshold: Optional[float] = Field(None, description="Этап 1: минимальное косинусное сходство")
+    rerank: Optional[str] = Field(None, description="Этап 2: none | heuristic («Эвристика (без LLM)») | model («Модель-реранкер»)")
+    rerank_model: Optional[str] = Field(None, description="Модель-реранкер «провайдер/модель» (по умолчанию — модель сервиса)")
+    rerank_threshold: Optional[float] = Field(None, description="Минимальный балл после реранкинга (0..1)")
     filters: Optional[Dict[str, Any]] = Field(
         None, description="document_ids, source_ids, doc_types, source_types, languages, "
                           "doc_date: {gte, lte}, metadata: {ключ: значение | [значения]}")
@@ -358,6 +362,11 @@ def health(request: Request) -> Dict[str, Any]:
 @router.get("/info")
 def info(request: Request) -> Dict[str, Any]:
     return _svc(request).info()
+
+
+@router.get("/rerank-models")
+def rerank_models(request: Request) -> Dict[str, Any]:
+    return _svc(request).rerank_models()
 
 
 @router.get("/embedding-models")

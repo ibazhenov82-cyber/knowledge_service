@@ -129,6 +129,8 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/api/v1/health").json()["status"], "ok")
         info = self.client.get("/api/v1/info").json()
         self.assertIn(".pdf", info["formats"]["documents"])
+        self.assertEqual(self.client.get("/api/v1/rerank-models").json(), {"items": [], "default": None})
+        self.assertEqual([m["id"] for m in info["rerank_methods"]], ["none", "heuristic", "model"])
         models = self.client.get("/api/v1/embedding-models").json()
         self.assertEqual(models["default"], "ollama/qwen3-embedding:0.6b")
         self.assertEqual(self.client.get("/api/v1/fs").status_code, 400)
