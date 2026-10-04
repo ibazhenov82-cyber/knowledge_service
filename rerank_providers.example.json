@@ -1,0 +1,20 @@
+{
+  "local": {
+    "title": "llama.cpp (bge-reranker)",
+    "base_url": "http://localhost:8081/v1",
+    "models": ["bge-reranker-v2-m3"],
+    "api": "jina"
+  },
+  "tei": {
+    "title": "Text Embeddings Inference",
+    "base_url": "http://localhost:8082",
+    "models": ["BAAI/bge-reranker-v2-m3"],
+    "api": "tei"
+  },
+  "jina": {
+    "title": "Jina AI",
+    "base_url": "https://api.jina.ai/v1",
+    "api_key": "${JINA_API_KEY}",
+    "models": ["jina-reranker-v2-base-multilingual"]
+  }
+}
